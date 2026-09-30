@@ -1,8 +1,9 @@
 """
 Сводная выгрузка административной панели МИАЦ:
   1. Категории вакансий
-  2. Организации
-  3. Вакансии
+  2. Номенклатура должностей (vacancy_list)
+  3. Организации
+  4. Вакансии
 
 Результат — единый dump.json (UTF-8), сохраняется инкрементально.
 """
@@ -29,6 +30,7 @@ LOGOUT_PATH = os.getenv("LOGOUT_PATH", "/admin/logout")
 ORG_PATH    = os.getenv("ORG_PATH", "/admin/organization")
 VAC_PATH    = os.getenv("VAC_PATH", "/admin/vacancy")
 CAT_PATH    = os.getenv("CAT_PATH", "/admin/vacancy/category/index")
+VLIST_PATH  = os.getenv("VLIST_PATH", "/admin/vacancy/list/index")
 
 SITE_USER   = os.getenv("SITE_USER", "")
 SITE_PASS   = os.getenv("SITE_PASS", "")
@@ -36,9 +38,10 @@ SITE_PASS   = os.getenv("SITE_PASS", "")
 TIMEOUT     = int(os.getenv("TIMEOUT", "15"))
 VERIFY_TLS  = os.getenv("VERIFY_TLS", "True").lower() in ("1", "true", "yes", "y")
 
-MAX_ORG_PAGES = int(os.getenv("ORG_MAX_PAGES", "50"))
-MAX_VAC_PAGES = int(os.getenv("VAC_MAX_PAGES", "300"))
-MAX_CAT_PAGES = int(os.getenv("CAT_MAX_PAGES", "50"))
+MAX_ORG_PAGES   = int(os.getenv("ORG_MAX_PAGES", "50"))
+MAX_VAC_PAGES   = int(os.getenv("VAC_MAX_PAGES", "300"))
+MAX_CAT_PAGES   = int(os.getenv("CAT_MAX_PAGES", "50"))
+MAX_VLIST_PAGES = int(os.getenv("VLIST_MAX_PAGES", "50"))
 
 OUT_FILE    = os.getenv("OUT_FILE", "dump.json")
 
@@ -57,6 +60,7 @@ logout_url = urljoin(BASE_URL + "/", LOGOUT_PATH.lstrip("/"))
 org_url    = urljoin(BASE_URL + "/", ORG_PATH.lstrip("/"))
 vac_url    = urljoin(BASE_URL + "/", VAC_PATH.lstrip("/"))
 cat_url    = urljoin(BASE_URL + "/", CAT_PATH.lstrip("/"))
+vlist_url  = urljoin(BASE_URL + "/", VLIST_PATH.lstrip("/"))
 
 
 # ==================== ОБЩИЕ ХЕЛПЕРЫ ====================
@@ -327,8 +331,7 @@ def parse_category_row(item: Tag) -> dict:
         classes = get_classes(child)
         if "col" not in classes:
             continue
-        text = child.get_text(" ", strip=True)
-        low = text.lower()
+        low = child.get_text(" ", strip=True).lower()
         is_center = "text-center" in classes
         strong = child.find("strong")
         small = child.find("small")
@@ -384,6 +387,103 @@ def dump_categories(
         cat_id = row.get("id")
         if isinstance(cat_id, int):
             row["detail"] = fetch_category_detail(session, cat_id)
+        if i % save_every == 0 or i == total:
+            print(f"    [{i}/{total}]", file=sys.stderr)
+            save_cb()
+
+    return rows
+
+
+# ==================== НОМЕНКЛАТУРА ДОЛЖНОСТЕЙ ====================
+def parse_vlist_row(item: Tag) -> dict:
+    """
+    Строка .item-user в /admin/vacancy/list/index:
+      name, category_label, id, created_at
+    """
+    out: dict = {}
+
+    upd = item.find("a", href=re.compile(r"/vacancy/list/update\?id=\d+"))
+    if isinstance(upd, Tag):
+        m = re.search(r"[?&]id=(\d+)", attr_str(upd, "href"))
+        if m is not None:
+            out["id"] = int(m.group(1))
+
+    card = item.find("div", class_="card")
+    if not isinstance(card, Tag):
+        return out
+
+    for child in card.find_all(recursive=False):
+        if not isinstance(child, Tag) or child.name != "div":
+            continue
+        classes = get_classes(child)
+        if "col" not in classes:
+            continue
+
+        low = child.get_text(" ", strip=True).lower()
+        is_center = "text-center" in classes
+        strong = child.find("strong")
+        small = child.find("small")
+
+        # Название (не в text-center, без <small>)
+        if not is_center and isinstance(strong, Tag) and not isinstance(small, Tag):
+            if "name" not in out:
+                out["name"] = strong.get_text(strip=True)
+            continue
+
+        # Категория (может быть и в text-center, и без)
+        if isinstance(small, Tag) and low.startswith("категория"):
+            if isinstance(strong, Tag):
+                out["category_label"] = strong.get_text(strip=True)
+            continue
+
+        # id — уже из href
+        if is_center and isinstance(small, Tag) and low.startswith("id"):
+            continue
+
+        # Дата создания
+        if is_center and isinstance(small, Tag) and low.startswith("дата создания"):
+            if isinstance(strong, Tag):
+                out["created_at"] = strong.get_text(strip=True)
+            continue
+
+    return out
+
+
+def fetch_vlist_detail(session: requests.Session, item_id: int) -> dict:
+    url = f"{vlist_url.replace('/index', '')}/update?id={item_id}&_return=1"
+    try:
+        r = session.get(url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    return {
+        "url": url,
+        "http_status": r.status_code,
+        "title": page_title(r.text),
+        "form": parse_form(r.text, "vacancy-form", "VacancyList["),
+        "meta": parse_meta(soup),
+    }
+
+
+def dump_vlist(
+    session: requests.Session,
+    report: dict,
+    save_cb,
+    save_every: int = 25,
+) -> list[dict]:
+    print("[*] Номенклатура должностей...", file=sys.stderr)
+    rows = fetch_list(session, vlist_url, "item-user", parse_vlist_row, MAX_VLIST_PAGES)
+    total = len(rows)
+    print(f"    найдено: {total}, тянем детали...", file=sys.stderr)
+
+    report["vacancy_list"] = {"count": total, "items": rows}
+    save_cb()
+
+    for i, row in enumerate(rows, 1):
+        item_id = row.get("id")
+        if isinstance(item_id, int):
+            row["detail"] = fetch_vlist_detail(session, item_id)
         if i % save_every == 0 or i == total:
             print(f"    [{i}/{total}]", file=sys.stderr)
             save_cb()
@@ -642,9 +742,10 @@ def main() -> int:
         "target": BASE_URL,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "login": None,
-        "categories": {"count": 0, "items": []},
-        "organizations": {"count": 0, "items": []},
-        "vacancies": {"count": 0, "items": []},
+        "categories":   {"count": 0, "items": []},
+        "vacancy_list": {"count": 0, "items": []},
+        "organizations":{"count": 0, "items": []},
+        "vacancies":    {"count": 0, "items": []},
         "logout": None,
         "finished_at": None,
     }
@@ -669,14 +770,21 @@ def main() -> int:
             report["categories"]["error"] = str(e)
             save_cb()
 
-        # ---- 2. организации ----
+        # ---- 2. номенклатура должностей ----
+        try:
+            dump_vlist(session, report, save_cb)
+        except requests.RequestException as e:
+            report["vacancy_list"]["error"] = str(e)
+            save_cb()
+
+        # ---- 3. организации ----
         try:
             dump_organizations(session, report, save_cb)
         except requests.RequestException as e:
             report["organizations"]["error"] = str(e)
             save_cb()
 
-        # ---- 3. вакансии ----
+        # ---- 4. вакансии ----
         try:
             dump_vacancies(session, report, save_cb)
         except requests.RequestException as e:
@@ -699,6 +807,7 @@ def main() -> int:
     print(
         f"OK: {OUT_FILE} "
         f"(categories={report['categories']['count']}, "
+        f"vacancy_list={report['vacancy_list']['count']}, "
         f"organizations={report['organizations']['count']}, "
         f"vacancies={report['vacancies']['count']})"
     )
