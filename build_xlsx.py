@@ -1,12 +1,18 @@
 """
 Генерация XLSX по категориям из dump.json.
 
+Структура листа:
+  строка 1 — заголовки колонок
+  строка 2 — строка фильтров (автофильтр Excel: специальность, организация,
+             район, режим работы и остальные колонки)
+  строка 3+ — данные
+
 Выход:
-  - vacancies_vrachi.xlsx            — все «Врач»
-  - vacancies_sredniy_medpersonal.xlsx — все «Средний медицинский персонал»
-  - vacancies_mladshiy_medpersonal.xlsx — все «Младший медицинский персонал»
-  - for_universities.xlsx            — «Врач» + «Средний медицинский персонал»
-  - for_colleges.xlsx                — «Средний медицинский персонал» + «Младший медицинский персонал»
+  - vacancies_vrachi.xlsx
+  - vacancies_sredniy_medpersonal.xlsx
+  - vacancies_mladshiy_medpersonal.xlsx
+  - for_universities.xlsx
+  - for_colleges.xlsx
 
 Зависимость: pip install openpyxl
 """
@@ -17,15 +23,14 @@ import sys
 from typing import Callable
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 IN_FILE = "dump.json"
 
-# --- идентификаторы категорий из /admin/vacancy/category/index ---
-CAT_DOCTOR = "1"   # Врач
-CAT_MIDDLE = "2"   # Средний медицинский персонал
-CAT_JUNIOR = "3"   # Младший медицинский персонал
+CAT_DOCTOR = "1"
+CAT_MIDDLE = "2"
+CAT_JUNIOR = "3"
 
 COLUMNS = [
     ("title",          "Название вакансии",         50),
@@ -224,24 +229,45 @@ def build_rows(data: dict) -> list[dict]:
 
 
 # ---------- запись xlsx ----------
+FILTER_FILL = PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid")
+
+
 def write_xlsx(rows: list[dict], path: str, sheet_name: str) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name[:31]
 
+    n_cols = len(COLUMNS)
+    last_col_letter = get_column_letter(n_cols)
+
+    # --- Строка 1: заголовки колонок ---
     for i, (_, title, width) in enumerate(COLUMNS, start=1):
         c = ws.cell(row=1, column=i, value=title)
         c.font = Font(bold=True)
-        c.alignment = Alignment(vertical="center", wrap_text=True)
+        c.alignment = Alignment(vertical="center", wrap_text=True, horizontal="center")
         ws.column_dimensions[get_column_letter(i)].width = width
-    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[1].height = 30
 
-    for r_idx, row in enumerate(rows, start=2):
+    # --- Строка 2: строка фильтров (автофильтр Excel повесит сюда стрелки) ---
+    for i in range(1, n_cols + 1):
+        c = ws.cell(row=2, column=i, value="")
+        c.fill = FILTER_FILL
+        c.alignment = Alignment(vertical="center")
+    ws.row_dimensions[2].height = 18
+
+    # --- Строка 3+: данные ---
+    for r_idx, row in enumerate(rows, start=3):
         for c_idx, (key, _, _) in enumerate(COLUMNS, start=1):
             c = ws.cell(row=r_idx, column=c_idx, value=row.get(key, ""))
             c.alignment = Alignment(vertical="top", wrap_text=True)
 
-    ws.freeze_panes = "A2"
+    # --- Автофильтр на 2-й строке ---
+    last_row = 2 + len(rows)
+    ws.auto_filter.ref = f"A2:{last_col_letter}{last_row}"
+
+    # --- Закрепление: заголовки + строка фильтров всегда сверху ---
+    ws.freeze_panes = "A3"
+
     wb.save(path)
 
 
