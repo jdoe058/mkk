@@ -1,3 +1,12 @@
+"""
+Сводная выгрузка административной панели МИАЦ:
+  1. Категории вакансий
+  2. Организации
+  3. Вакансии
+
+Результат — единый dump.json (UTF-8), сохраняется инкрементально.
+"""
+
 import json
 import os
 import re
@@ -109,6 +118,14 @@ def max_page_from_pagination(html: str) -> int:
     return mx
 
 
+def save_report(report: dict, path: str = OUT_FILE) -> None:
+    """Атомарная запись UTF-8 JSON через temp + rename."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def parse_meta(soup: BeautifulSoup) -> dict:
     meta: dict = {}
     for ul in soup.find_all("ul", class_="list-group"):
@@ -200,12 +217,7 @@ def fetch_list(
     row_parser,
     max_pages: int,
 ) -> list[dict]:
-    """
-    Универсальный обход списочной страницы:
-      1) POST pageSize=all
-      2) GET, парсинг строк
-      3) fallback на пагинацию, если pageSize=all не сработал
-    """
+    """Универсальный обход списочной страницы."""
     r0 = session.get(url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
     csrf = extract_csrf(r0.text)
     if csrf:
@@ -354,17 +366,28 @@ def fetch_category_detail(session: requests.Session, cat_id: int) -> dict:
     }
 
 
-def dump_categories(session: requests.Session) -> list[dict]:
+def dump_categories(
+    session: requests.Session,
+    report: dict,
+    save_cb,
+    save_every: int = 10,
+) -> list[dict]:
     print("[*] Категории вакансий...", file=sys.stderr)
     rows = fetch_list(session, cat_url, "item-user", parse_category_row, MAX_CAT_PAGES)
     total = len(rows)
     print(f"    найдено: {total}, тянем детали...", file=sys.stderr)
+
+    report["categories"] = {"count": total, "items": rows}
+    save_cb()
+
     for i, row in enumerate(rows, 1):
         cat_id = row.get("id")
         if isinstance(cat_id, int):
             row["detail"] = fetch_category_detail(session, cat_id)
-        if i % 10 == 0 or i == total:
+        if i % save_every == 0 or i == total:
             print(f"    [{i}/{total}]", file=sys.stderr)
+            save_cb()
+
     return rows
 
 
@@ -475,17 +498,28 @@ def fetch_org_detail(session: requests.Session, org_id: int) -> dict:
     }
 
 
-def dump_organizations(session: requests.Session) -> list[dict]:
+def dump_organizations(
+    session: requests.Session,
+    report: dict,
+    save_cb,
+    save_every: int = 25,
+) -> list[dict]:
     print("[*] Организации...", file=sys.stderr)
     rows = fetch_list(session, org_url, "item-organization", parse_org_row, MAX_ORG_PAGES)
     total = len(rows)
     print(f"    найдено: {total}, тянем детали...", file=sys.stderr)
+
+    report["organizations"] = {"count": total, "items": rows}
+    save_cb()
+
     for i, row in enumerate(rows, 1):
         org_id = row.get("id")
         if isinstance(org_id, int):
             row["detail"] = fetch_org_detail(session, org_id)
-        if i % 25 == 0 or i == total:
+        if i % save_every == 0 or i == total:
             print(f"    [{i}/{total}]", file=sys.stderr)
+            save_cb()
+
     return rows
 
 
@@ -569,17 +603,28 @@ def fetch_vacancy_detail(session: requests.Session, vac_id: int) -> dict:
     }
 
 
-def dump_vacancies(session: requests.Session) -> list[dict]:
+def dump_vacancies(
+    session: requests.Session,
+    report: dict,
+    save_cb,
+    save_every: int = 50,
+) -> list[dict]:
     print("[*] Вакансии...", file=sys.stderr)
     rows = fetch_list(session, vac_url, "item-user", parse_vacancy_row, MAX_VAC_PAGES)
     total = len(rows)
     print(f"    найдено: {total}, тянем детали...", file=sys.stderr)
+
+    report["vacancies"] = {"count": total, "items": rows}
+    save_cb()
+
     for i, row in enumerate(rows, 1):
         vac_id = row.get("id")
         if isinstance(vac_id, int):
             row["detail"] = fetch_vacancy_detail(session, vac_id)
-        if i % 50 == 0 or i == total:
+        if i % save_every == 0 or i == total:
             print(f"    [{i}/{total}]", file=sys.stderr)
+            save_cb()
+
     return rows
 
 
@@ -604,43 +649,52 @@ def main() -> int:
         "finished_at": None,
     }
 
-    ok, who = do_login(session)
-    report["login"] = {"status": "PASS" if ok else "FAIL", "username": who}
-    if not ok:
+    def save_cb() -> None:
+        save_report(report, OUT_FILE)
+
+    exit_code = 0
+    try:
+        # ---- логин ----
+        ok, who = do_login(session)
+        report["login"] = {"status": "PASS" if ok else "FAIL", "username": who}
+        save_cb()
+        if not ok:
+            print(f"ERROR: login failed -> {OUT_FILE}", file=sys.stderr)
+            return 2
+
+        # ---- 1. категории ----
+        try:
+            dump_categories(session, report, save_cb)
+        except requests.RequestException as e:
+            report["categories"]["error"] = str(e)
+            save_cb()
+
+        # ---- 2. организации ----
+        try:
+            dump_organizations(session, report, save_cb)
+        except requests.RequestException as e:
+            report["organizations"]["error"] = str(e)
+            save_cb()
+
+        # ---- 3. вакансии ----
+        try:
+            dump_vacancies(session, report, save_cb)
+        except requests.RequestException as e:
+            report["vacancies"]["error"] = str(e)
+            save_cb()
+
+    except KeyboardInterrupt:
+        print("\n[!] Прервано пользователем, сохраняю текущий прогресс...",
+              file=sys.stderr)
+        exit_code = 130
+    finally:
+        try:
+            report["logout"] = {"status": "PASS" if do_logout(session) else "FAIL"}
+        except Exception:
+            report["logout"] = {"status": "FAIL", "error": "logout crashed"}
+        session.cookies.clear()
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        with open(OUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        print(f"ERROR: login failed -> {OUT_FILE}", file=sys.stderr)
-        return 2
-
-    # 1. Категории
-    try:
-        cats = dump_categories(session)
-        report["categories"] = {"count": len(cats), "items": cats}
-    except requests.RequestException as e:
-        report["categories"]["error"] = str(e)
-
-    # 2. Организации
-    try:
-        orgs = dump_organizations(session)
-        report["organizations"] = {"count": len(orgs), "items": orgs}
-    except requests.RequestException as e:
-        report["organizations"]["error"] = str(e)
-
-    # 3. Вакансии
-    try:
-        vacs = dump_vacancies(session)
-        report["vacancies"] = {"count": len(vacs), "items": vacs}
-    except requests.RequestException as e:
-        report["vacancies"]["error"] = str(e)
-
-    # Логаут
-    report["logout"] = {"status": "PASS" if do_logout(session) else "FAIL"}
-    session.cookies.clear()
-    report["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    with open(OUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+        save_cb()
 
     print(
         f"OK: {OUT_FILE} "
@@ -648,7 +702,7 @@ def main() -> int:
         f"organizations={report['organizations']['count']}, "
         f"vacancies={report['vacancies']['count']})"
     )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
