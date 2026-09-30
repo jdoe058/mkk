@@ -1,7 +1,7 @@
+import json
 import os
 import re
 import sys
-import json
 import urllib3
 import requests
 from datetime import datetime, timezone
@@ -21,10 +21,10 @@ PASSWORD    = os.getenv("SITE_PASS", "")
 TIMEOUT     = int(os.getenv("TIMEOUT", "15"))
 VERIFY_TLS  = os.getenv("VERIFY_TLS", "True").lower() in ("1", "true", "yes", "y")
 MAX_PAGES   = int(os.getenv("MAX_PAGES", "30"))
+OUT_FILE    = os.getenv("OUT_FILE", "organizations.json")
 
 if not BASE_URL or not USERNAME or not PASSWORD:
-    print(json.dumps({"error": "Проверь .env: BASE_URL, SITE_USER, SITE_PASS"},
-                     ensure_ascii=False, indent=2))
+    print("ERROR: .env must define BASE_URL, SITE_USER, SITE_PASS", file=sys.stderr)
     sys.exit(1)
 
 if not VERIFY_TLS:
@@ -35,26 +35,8 @@ login_url  = urljoin(BASE_URL + "/", LOGIN_PATH.lstrip("/"))
 logout_url = urljoin(BASE_URL + "/", LOGOUT_PATH.lstrip("/"))
 org_url    = urljoin(BASE_URL + "/", ORG_PATH.lstrip("/"))
 
-report: dict = {
-    "target": BASE_URL,
-    "started_at": datetime.now(timezone.utc).isoformat(),
-    "login": None,
-    "organizations": {"count": 0, "items": []},
-    "logout": None,
-    "finished_at": None,
-}
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-})
-
-
-# ---------- утилиты ----------
+# ---------- helpers ----------
 def attr_str(tag: Tag | None, name: str) -> str:
     if not isinstance(tag, Tag):
         return ""
@@ -64,9 +46,26 @@ def attr_str(tag: Tag | None, name: str) -> str:
     return str(v) if v is not None else ""
 
 
-def page_title(html: str) -> str:
-    tag = BeautifulSoup(html, "html.parser").title
-    return tag.get_text(strip=True) if tag is not None else ""
+def get_classes(tag: Tag) -> list[str]:
+    c = tag.get("class") or []
+    return c if isinstance(c, list) else [c]
+
+
+def set_nested(d: dict, name: str, value) -> None:
+    """Organization[map][latitude]=X -> d["Organization"]["map"]["latitude"]=X"""
+    m = re.match(r"^([^\[]+)((?:\[[^\]]+\])*)$", name)
+    if m is None:
+        d[name] = value
+        return
+    keys = [m.group(1)] + re.findall(r"\[([^\]]+)\]", m.group(2))
+    cur = d
+    for k in keys[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[k] = nxt
+        cur = nxt
+    cur[keys[-1]] = value
 
 
 def extract_csrf(html: str) -> str | None:
@@ -78,23 +77,25 @@ def extract_csrf(html: str) -> str | None:
             return v
     meta = soup.find("meta", {"name": "csrf-token"})
     if isinstance(meta, Tag):
-        v = attr_str(meta, "content")
-        if v:
-            return v
+        return attr_str(meta, "content") or None
     return None
 
 
-# ---------- логин ----------
-def do_login() -> tuple[bool, str]:
+def page_title(html: str) -> str:
+    tag = BeautifulSoup(html, "html.parser").title
+    return tag.get_text(strip=True) if tag is not None else ""
+
+
+# ---------- auth ----------
+def do_login(session: requests.Session) -> tuple[bool, str]:
     try:
-        r = session.get(admin_url, timeout=TIMEOUT,
-                        verify=VERIFY_TLS, allow_redirects=True)
+        r = session.get(admin_url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
     except requests.RequestException as e:
-        return False, f"GET admin: {e}"
+        return False, f"GET admin failed: {e}"
 
     csrf = extract_csrf(r.text)
     if not csrf:
-        return False, "CSRF не найден на странице логина"
+        return False, "CSRF not found"
 
     try:
         resp = session.post(login_url, data={
@@ -105,61 +106,44 @@ def do_login() -> tuple[bool, str]:
             "login-button": "",
         }, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
     except requests.RequestException as e:
-        return False, f"POST login: {e}"
+        return False, f"POST login failed: {e}"
 
-    login_form_still = ("login-form" in resp.text) or ("loginform-password" in resp.text)
-    ok = (not login_form_still) and resp.url.rstrip("/") != login_url.rstrip("/")
-    if ok:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        btn = soup.find("button", {"id": "user-nav-btn"})
-        name = btn.get_text(strip=True).replace("\xa0", " ").strip() \
-               if isinstance(btn, Tag) else ""
-        report["login"] = {"status": "PASS", "username": name,
-                           "title": page_title(resp.text), "final_url": resp.url}
-        return True, name
-    report["login"] = {"status": "FAIL", "title": page_title(resp.text),
-                       "final_url": resp.url}
-    return False, "вход не выполнен"
+    if "login-form" in resp.text:
+        return False, "login form still present"
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    btn = soup.find("button", {"id": "user-nav-btn"})
+    name = btn.get_text(strip=True).replace("\xa0", " ").strip() if isinstance(btn, Tag) else ""
+    return True, name
 
 
-# ---------- логаут ----------
-def do_logout() -> bool:
+def do_logout(session: requests.Session) -> bool:
     try:
-        r = session.get(admin_url, timeout=TIMEOUT,
-                        verify=VERIFY_TLS, allow_redirects=True)
-    except requests.RequestException as e:
-        report["logout"] = {"status": "FAIL", "error": str(e)}
+        r = session.get(admin_url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+    except requests.RequestException:
         return False
-
     soup = BeautifulSoup(r.text, "html.parser")
     form = soup.find("form", attrs={"action": re.compile("logout", re.I)})
-    if isinstance(form, Tag):
-        action = attr_str(form, "action") or LOGOUT_PATH
-        tok = form.find("input", {"name": "_csrf"})
-        data = {"_csrf": attr_str(tok, "value")} if isinstance(tok, Tag) else {}
-        url = urljoin(BASE_URL, action)
-        try:
-            rr = session.post(url, data=data, timeout=TIMEOUT,
-                              verify=VERIFY_TLS, allow_redirects=True)
-            report["logout"] = {"status": "PASS",
-                                "detail": f"POST {url} → {rr.status_code} {rr.url}"}
-            return True
-        except requests.RequestException as e:
-            report["logout"] = {"status": "FAIL", "error": str(e)}
-            return False
-    report["logout"] = {"status": "FAIL", "error": "форма логаута не найдена"}
-    return False
+    if not isinstance(form, Tag):
+        return False
+    tok = form.find("input", {"name": "_csrf"})
+    data = {"_csrf": attr_str(tok, "value")} if isinstance(tok, Tag) else {}
+    try:
+        session.post(logout_url, data=data, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+        return True
+    except requests.RequestException:
+        return False
 
 
-# ---------- парсинг одной организации ----------
-def parse_org(item: Tag) -> dict:
+# ---------- список организаций ----------
+def parse_org_row(item: Tag) -> dict:
+    """Одна .item-organization из списка → id, name, territory, views, created_at."""
     out: dict = {}
 
-    # id из ссылки update
     upd = item.find("a", href=re.compile(r"/organization/update\?id=\d+"))
     if isinstance(upd, Tag):
         m = re.search(r"[?&]id=(\d+)", attr_str(upd, "href"))
-        if m:
+        if m is not None:
             out["id"] = int(m.group(1))
 
     group = item.find("div", class_="btn-group")
@@ -169,39 +153,34 @@ def parse_org(item: Tag) -> dict:
     for child in group.find_all(recursive=False):
         if not isinstance(child, Tag) or child.name != "div":
             continue
-        classes = child.get("class") or []
-        if "col" not in classes:
-            continue
+
+        classes = get_classes(child)
         text = child.get_text(" ", strip=True)
         low = text.lower()
         is_center = "text-center" in classes
+
         strong = child.find("strong")
         small = child.find("small")
 
-        # Название: div.col.align-self-center с <strong>, без <small>
         if not is_center and isinstance(strong, Tag) and not isinstance(small, Tag):
             if "name" not in out:
                 out["name"] = strong.get_text(strip=True)
             continue
 
-        # Район: div.col.align-self-center с <small>, текст начинается с "Район"
         if not is_center and isinstance(small, Tag) and low.startswith("район"):
             if isinstance(strong, Tag):
                 out["territory"] = strong.get_text(strip=True)
             continue
 
-        # id (пропускаем, уже взяли из ссылки)
         if is_center and isinstance(small, Tag) and low.startswith("id"):
             continue
 
-        # Просмотры
         if is_center and "просмотры" in low:
             m = re.search(r"(\d+)", text)
-            if m:
+            if m is not None:
                 out["views"] = int(m.group(1))
             continue
 
-        # Создан
         if is_center and isinstance(small, Tag) and low.startswith("создан"):
             if isinstance(strong, Tag):
                 out["created_at"] = strong.get_text(strip=True)
@@ -210,15 +189,15 @@ def parse_org(item: Tag) -> dict:
     return out
 
 
-def parse_orgs(html: str) -> list[dict]:
+def parse_org_rows(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    items: list[dict] = []
+    rows: list[dict] = []
     for item in soup.find_all("div", class_="item-organization"):
         if isinstance(item, Tag):
-            parsed = parse_org(item)
+            parsed = parse_org_row(item)
             if parsed:
-                items.append(parsed)
-    return items
+                rows.append(parsed)
+    return rows
 
 
 def max_page_from_pagination(html: str) -> int:
@@ -226,64 +205,237 @@ def max_page_from_pagination(html: str) -> int:
     mx = 1
     for a in soup.find_all("a", class_="page-link"):
         m = re.search(r"[?&]page=(\d+)", attr_str(a, "href"))
-        if m:
+        if m is not None:
             mx = max(mx, int(m.group(1)))
     return mx
 
 
-# ---------- сбор всех организаций ----------
-def collect_organizations() -> list[dict]:
-    # получаем страницу, чтобы взять свежий CSRF
-    r0 = session.get(org_url, timeout=TIMEOUT, verify=VERIFY_TLS,
-                     allow_redirects=True)
+def fetch_org_list(session: requests.Session) -> list[dict]:
+    # свежий CSRF для pageSize=all
+    r0 = session.get(org_url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
     csrf = extract_csrf(r0.text)
-
-    # просим все сразу
     if csrf:
-        session.post(org_url, data={"_csrf": csrf, "pageSize": "all"},
-                     timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+        try:
+            session.post(org_url, data={"_csrf": csrf, "pageSize": "all"},
+                         timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+        except requests.RequestException:
+            pass
 
-    # финальный GET страницы
-    r = session.get(org_url, timeout=TIMEOUT, verify=VERIFY_TLS,
-                    allow_redirects=True)
-    items = parse_orgs(r.text)
+    r = session.get(org_url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+    rows = parse_org_rows(r.text)
     pages = max_page_from_pagination(r.text)
 
-    # если pageSize=all не сработал — идём по страницам
-    if pages > 1 and len(items) <= 20:
-        seen_ids = {it.get("id") for it in items if it.get("id")}
+    # fallback: если pageSize=all не сработал и на странице стандартные 20
+    if pages > 1 and len(rows) <= 20:
+        seen = {x.get("id") for x in rows if x.get("id")}
         for p in range(2, min(pages, MAX_PAGES) + 1):
-            rp = session.get(f"{org_url}?page={p}", timeout=TIMEOUT,
-                             verify=VERIFY_TLS, allow_redirects=True)
-            for it in parse_orgs(rp.text):
-                if it.get("id") not in seen_ids:
-                    items.append(it)
-                    if it.get("id"):
-                        seen_ids.add(it["id"])
+            try:
+                rp = session.get(f"{org_url}?page={p}", timeout=TIMEOUT,
+                                 verify=VERIFY_TLS, allow_redirects=True)
+            except requests.RequestException:
+                continue
+            for row in parse_org_rows(rp.text):
+                if row.get("id") not in seen:
+                    rows.append(row)
+                    if row.get("id"):
+                        seen.add(row["id"])
 
-    return items
+    return rows
+
+
+# ---------- карточка организации ----------
+def parse_form(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form", {"id": "organization-form"})
+    if not isinstance(form, Tag):
+        return {}
+
+    out: dict = {}
+
+    for inp in form.find_all("input"):
+        if not isinstance(inp, Tag):
+            continue
+        name = attr_str(inp, "name")
+        if not name.startswith("Organization[") or name.endswith("[]"):
+            continue
+        itype = (attr_str(inp, "type") or "text").lower()
+        if itype == "file":
+            continue
+        if itype == "radio":
+            if inp.get("checked") is not None:
+                value = attr_str(inp, "value")
+                nxt = inp.find_next_sibling("label")
+                label = nxt.get_text(strip=True) if isinstance(nxt, Tag) else ""
+                set_nested(out, name, {"value": value, "label": label} if label else value)
+            continue
+        if itype == "checkbox":
+            if inp.get("checked") is not None:
+                set_nested(out, name, attr_str(inp, "value"))
+            continue
+        set_nested(out, name, attr_str(inp, "value"))
+
+    for sel in form.find_all("select"):
+        if not isinstance(sel, Tag):
+            continue
+        name = attr_str(sel, "name")
+        if not name.startswith("Organization["):
+            continue
+        for opt in sel.find_all("option"):
+            if not isinstance(opt, Tag):
+                continue
+            if opt.get("selected") is not None:
+                set_nested(out, name, {
+                    "value": attr_str(opt, "value"),
+                    "label": opt.get_text(strip=True),
+                })
+                break
+
+    for ta in form.find_all("textarea"):
+        if not isinstance(ta, Tag):
+            continue
+        name = attr_str(ta, "name")
+        if not name.startswith("Organization["):
+            continue
+        set_nested(out, name, ta.get_text())
+
+    return out
+
+
+def parse_meta(soup: BeautifulSoup) -> dict:
+    meta: dict = {}
+    for ul in soup.find_all("ul", class_="list-group"):
+        if not isinstance(ul, Tag):
+            continue
+        parent = ul.parent
+        if isinstance(parent, Tag) and "dropdown-menu" in get_classes(parent):
+            continue
+        for li in ul.find_all("li", class_="list-group-item"):
+            if not isinstance(li, Tag):
+                continue
+            txt = li.get_text(" ", strip=True)
+            if ":" not in txt:
+                continue
+            k, _, v = txt.partition(":")
+            k, v = k.strip().lower(), v.strip()
+            if k == "создатель":
+                meta["creator"] = v
+            elif k == "дата создания":
+                meta["created_at"] = v
+            elif k == "дата обновления":
+                meta["updated_at"] = v
+            elif k == "район":
+                meta["territory"] = v
+    return meta
+
+
+def parse_files(soup: BeautifulSoup) -> list[dict]:
+    files: list[dict] = []
+    for wrapper in soup.find_all("div", id=re.compile(r"^fileblock-wrapper-gallery-\d+$")):
+        if not isinstance(wrapper, Tag):
+            continue
+        for card in wrapper.find_all("div", class_="card", recursive=False):
+            if not isinstance(card, Tag):
+                continue
+            info: dict = {}
+            m = re.match(r"file-(\d+)-(\d+)$", attr_str(card, "id"))
+            if m is not None:
+                info["id"] = int(m.group(1))
+            img = card.find("img")
+            if isinstance(img, Tag):
+                info["url"] = attr_str(img, "src")
+            for li in card.find_all("li", class_="list-group-item"):
+                if not isinstance(li, Tag):
+                    continue
+                txt = li.get_text(" ", strip=True)
+                if ":" in txt:
+                    k, _, v = txt.partition(":")
+                    k, v = k.strip().lower(), v.strip()
+                    if k == "имя на сервере":
+                        info["server_name"] = v
+                    elif k == "размер":
+                        info["size"] = v
+                    elif k == "дата загрузки":
+                        info["uploaded_at"] = v
+                    elif k == "путь":
+                        info["path"] = v
+                else:
+                    strong = li.find("strong")
+                    if isinstance(strong, Tag):
+                        info["name"] = strong.get_text(strip=True)
+            files.append(info)
+    return files
+
+
+def fetch_org_detail(session: requests.Session, org_id: int) -> dict:
+    url = f"{org_url}/update?id={org_id}&_return=1"
+    try:
+        r = session.get(url, timeout=TIMEOUT, verify=VERIFY_TLS, allow_redirects=True)
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    return {
+        "url": url,
+        "http_status": r.status_code,
+        "title": page_title(r.text),
+        "form": parse_form(r.text),
+        "meta": parse_meta(soup),
+        "files": parse_files(soup),
+    }
 
 
 # ---------- main ----------
-ok, who = do_login()
-if not ok:
+def main() -> int:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    })
+
+    report: dict = {
+        "target": BASE_URL,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "login": None,
+        "organizations": {"count": 0, "items": []},
+        "logout": None,
+        "finished_at": None,
+    }
+
+    ok, who = do_login(session)
+    report["login"] = {"status": "PASS" if ok else "FAIL", "username": who}
+    if not ok:
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        with open(OUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"ERROR: login failed -> {OUT_FILE}", file=sys.stderr)
+        return 2
+
+    try:
+        rows = fetch_org_list(session)
+    except requests.RequestException as e:
+        rows = []
+        report["organizations"]["error"] = str(e)
+
+    total = len(rows)
+    for i, row in enumerate(rows, 1):
+        org_id = row.get("id")
+        if isinstance(org_id, int):
+            row["detail"] = fetch_org_detail(session, org_id)
+        print(f"  [{i}/{total}] id={org_id}", file=sys.stderr)
+
+    report["organizations"] = {"count": total, "items": rows}
+    report["logout"] = {"status": "PASS" if do_logout(session) else "FAIL"}
+    session.cookies.clear()
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    sys.exit(2)
 
-try:
-    orgs = collect_organizations()
-    report["organizations"] = {"count": len(orgs), "items": orgs}
-except requests.RequestException as e:
-    report["organizations"] = {"count": 0, "items": [], "error": str(e)}
+    with open(OUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
 
-do_logout()
-session.cookies.clear()
-report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    print(f"OK: {OUT_FILE} ({total} organizations)")
+    return 0
 
-OUT_FILE = os.getenv("OUT_FILE", "organizations.json")
 
-with open(OUT_FILE, "w", encoding="utf-8") as f:
-    json.dump(report, f, ensure_ascii=False, indent=2)
-
-print(f"Записано: {OUT_FILE} ({report['organizations']['count']} организаций)")
+if __name__ == "__main__":
+    sys.exit(main())
