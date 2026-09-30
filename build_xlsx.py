@@ -1,32 +1,20 @@
 """
-Генерация XLSX по категориям.
+Генерация XLSX по категориям из dump.json.
 
-Вход:  dump.json (от dump.py)
-Выход: по одному .xlsx на каждую из трёх категорий:
-         - Врач
-         - Средний медицинский персонал
-         - Младший медицинский персонал
+Выход:
+  - vacancies_vrachi.xlsx            — все «Врач»
+  - vacancies_sredniy_medpersonal.xlsx — все «Средний медицинский персонал»
+  - vacancies_mladshiy_medpersonal.xlsx — все «Младший медицинский персонал»
+  - for_universities.xlsx            — «Врач» + «Средний медицинский персонал»
+  - for_colleges.xlsx                — «Средний медицинский персонал» + «Младший медицинский персонал»
 
-Колонки:
-  title           — название вакансии (name_alt → name → номенклатура)
-  speciality      — категория
-  organization    — короткое название организации
-  area            — район
-  work_mode       — режим работы
-  org_address     — юридический адрес организации
-  org_phone       — телефон организации
-  org_website     — сайт
-  hr_contact      — контактное лицо отдела кадров
-  hr_phone        — телефон отдела кадров
-  hr_email        — e-mail для вакансий
-  social_support  — меры соцподдержки понятными словами (одно поле)
-
-Зависимость:  pip install openpyxl
+Зависимость: pip install openpyxl
 """
 
 import json
 import re
 import sys
+from typing import Callable
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
@@ -34,12 +22,10 @@ from openpyxl.utils import get_column_letter
 
 IN_FILE = "dump.json"
 
-# id категорий из /admin/vacancy/category/index
-TARGETS = [
-    ("1", "Врач",                       "vacancies_vrachi.xlsx"),
-    ("2", "Средний медицинский персонал", "vacancies_sredniy_medpersonal.xlsx"),
-    ("3", "Младший медицинский персонал", "vacancies_mladshiy_medpersonal.xlsx"),
-]
+# --- идентификаторы категорий из /admin/vacancy/category/index ---
+CAT_DOCTOR = "1"   # Врач
+CAT_MIDDLE = "2"   # Средний медицинский персонал
+CAT_JUNIOR = "3"   # Младший медицинский персонал
 
 COLUMNS = [
     ("title",          "Название вакансии",         50),
@@ -88,7 +74,7 @@ def dash(v) -> str:
     return s if s else "—"
 
 
-# ---------- справочники из dump.json ----------
+# ---------- справочники ----------
 def load_categories(data: dict) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for row in (data.get("categories") or {}).get("items") or []:
@@ -101,7 +87,6 @@ def load_categories(data: dict) -> dict[str, dict]:
 
 
 def load_vacancy_list(data: dict) -> dict[str, dict]:
-    """id номенклатуры → {name, category_id, category_label}."""
     result: dict[str, dict] = {}
     for row in (data.get("vacancy_list") or {}).get("items") or []:
         item_id = row.get("id")
@@ -145,7 +130,6 @@ def load_organizations(data: dict) -> dict[str, dict]:
 
 # ---------- соцподдержка ----------
 def format_social(form: dict) -> str:
-    """Собирает меры соцподдержки в одну понятную строку."""
     parts: list[str] = []
 
     def yes(key: str) -> bool:
@@ -181,13 +165,12 @@ def format_social(form: dict) -> str:
 
 
 # ---------- сборка строк ----------
-def build_rows(data: dict) -> list[tuple[str, dict]]:
-    """Возвращает список (category_id, row)."""
+def build_rows(data: dict) -> list[dict]:
     cats = load_categories(data)
     vlist = load_vacancy_list(data)
     orgs = load_organizations(data)
 
-    out: list[tuple[str, dict]] = []
+    out: list[dict] = []
 
     for vac in (data.get("vacancies") or {}).get("items") or []:
         detail = vac.get("detail") or {}
@@ -195,7 +178,6 @@ def build_rows(data: dict) -> list[tuple[str, dict]]:
             continue
         form = (detail.get("form") or {}).get("Vacancy") or {}
 
-        # --- категория через vacancy_list ---
         vl_id = str(form.get("vacancy_category") or "").strip()
         vl_entry = vlist.get(vl_id) or {}
         cat_id = vl_entry.get("category_id")
@@ -203,28 +185,26 @@ def build_rows(data: dict) -> list[tuple[str, dict]]:
         if not cat_id:
             continue
 
-        # --- организация ---
         org_id = str(field_value(form.get("organization")) or "")
         org = orgs.get(org_id) or {}
 
-        # --- район ---
-        area = ""
         terr = form.get("territory")
         if isinstance(terr, dict):
             area = terr.get("label") or ""
         elif isinstance(terr, str):
             area = terr
+        else:
+            area = ""
         if not area:
             area = org.get("territory") or ""
 
-        # --- название: name_alt → name → номенклатура ---
         title = (
             str(form.get("name_alt") or "").strip()
             or str(form.get("name") or "").strip()
             or str(vl_entry.get("name") or "").strip()
         )
 
-        row = {
+        out.append({
             "title":          dash(title),
             "speciality":     dash(cat_label),
             "organization":   dash(org.get("short_name") or org.get("name")),
@@ -237,8 +217,8 @@ def build_rows(data: dict) -> list[tuple[str, dict]]:
             "hr_phone":       dash(org.get("personnel_dep_phone")),
             "hr_email":       dash(org.get("personnel_dep_email")),
             "social_support": format_social(form),
-        }
-        out.append((cat_id, row))
+            "_cat_id":        cat_id,
+        })
 
     return out
 
@@ -247,9 +227,8 @@ def build_rows(data: dict) -> list[tuple[str, dict]]:
 def write_xlsx(rows: list[dict], path: str, sheet_name: str) -> None:
     wb = Workbook()
     ws = wb.active
-    ws.title = sheet_name[:31]  # Excel: имя листа ≤ 31 символа
+    ws.title = sheet_name[:31]
 
-    # шапка
     for i, (_, title, width) in enumerate(COLUMNS, start=1):
         c = ws.cell(row=1, column=i, value=title)
         c.font = Font(bold=True)
@@ -257,7 +236,6 @@ def write_xlsx(rows: list[dict], path: str, sheet_name: str) -> None:
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.row_dimensions[1].height = 24
 
-    # данные
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, (key, _, _) in enumerate(COLUMNS, start=1):
             c = ws.cell(row=r_idx, column=c_idx, value=row.get(key, ""))
@@ -265,6 +243,41 @@ def write_xlsx(rows: list[dict], path: str, sheet_name: str) -> None:
 
     ws.freeze_panes = "A2"
     wb.save(path)
+
+
+# ---------- цели ----------
+TARGETS: list[dict] = [
+    {
+        "label":     "Врач (все)",
+        "sheet":     "Врач",
+        "file":      "vacancies_vrachi.xlsx",
+        "predicate": lambda r: r["_cat_id"] == CAT_DOCTOR,
+    },
+    {
+        "label":     "Средний медперсонал (все)",
+        "sheet":     "Средний медперсонал",
+        "file":      "vacancies_sredniy_medpersonal.xlsx",
+        "predicate": lambda r: r["_cat_id"] == CAT_MIDDLE,
+    },
+    {
+        "label":     "Младший медперсонал (все)",
+        "sheet":     "Младший медперсонал",
+        "file":      "vacancies_mladshiy_medpersonal.xlsx",
+        "predicate": lambda r: r["_cat_id"] == CAT_JUNIOR,
+    },
+    {
+        "label":     "Для вузов: Врач + Средний медперсонал",
+        "sheet":     "Вузы",
+        "file":      "for_universities.xlsx",
+        "predicate": lambda r: r["_cat_id"] in (CAT_DOCTOR, CAT_MIDDLE),
+    },
+    {
+        "label":     "Для колледжей: Средний + Младший медперсонал",
+        "sheet":     "Колледжи",
+        "file":      "for_colleges.xlsx",
+        "predicate": lambda r: r["_cat_id"] in (CAT_MIDDLE, CAT_JUNIOR),
+    },
+]
 
 
 # ---------- main ----------
@@ -276,15 +289,16 @@ def main() -> int:
         print("ERROR: не собрано ни одной строки — проверь dump.json", file=sys.stderr)
         return 1
 
-    print(f"Всего вакансий с известной категорией: {len(all_rows)}")
+    print(f"Всего вакансий с известной категорией: {len(all_rows)}\n")
 
-    for cat_id, label, fname in TARGETS:
-        cat_rows = [r for cid, r in all_rows if cid == cat_id]
-        if not cat_rows:
-            print(f"  [!] {label}: 0 вакансий — пропускаю")
+    for t in TARGETS:
+        pred: Callable[[dict], bool] = t["predicate"]
+        rows = [r for r in all_rows if pred(r)]
+        if not rows:
+            print(f"  [!] {t['label']}: 0 вакансий — пропускаю")
             continue
-        write_xlsx(cat_rows, fname, sheet_name=label)
-        print(f"  {label}: {len(cat_rows)} вакансий → {fname}")
+        write_xlsx(rows, t["file"], sheet_name=t["sheet"])
+        print(f"  {t['label']}: {len(rows)} → {t['file']}")
 
     return 0
 
