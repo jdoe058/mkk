@@ -1,7 +1,6 @@
 .venv/
+.probes/
 .env
 __pycache__/
 *.pyc
-organizations.json
-org_*.json
 *.json
